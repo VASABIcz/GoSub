@@ -5,12 +5,16 @@ import (
 	"flag"
 	"log"
 	"net"
+	"runtime/debug"
 	"strconv"
 	"time"
 )
 
 const (
-	TYPE = "tcp"
+	TYPE            = "tcp"
+	AllocationLimit = 1_000_000
+	DEBUG           = false
+	HeapLimit       = 4_000_000_000
 )
 
 const (
@@ -20,8 +24,14 @@ const (
 	disconnect  = 'd'
 	publish     = 'e'
 	destroy     = 'f'
-	//dispatch    = 'g'
 )
+
+type ClientCorrupted struct {
+}
+
+func (c ClientCorrupted) Error() string {
+	return "client exceeded memory limit"
+}
 
 type message struct {
 	typ  int32
@@ -35,7 +45,13 @@ type subscribeMessage struct {
 
 type publishMessage struct {
 	channel string
-	msg     string
+	msg     *string
+}
+
+type dispatchMessage struct {
+	channel string
+	msg     *string
+	client  string
 }
 
 type unsubscribeMessage struct {
@@ -75,6 +91,15 @@ func (w *worker) publish(channel string, msg message) {
 	for k := range clients {
 		channels := w.clientMapping[k]
 		for c := range channels {
+			if DEBUG {
+				println("publishing to", k, channel)
+			}
+			parsed := msg.data.(publishMessage)
+			msg.data = dispatchMessage{
+				channel: parsed.channel,
+				msg:     parsed.msg,
+				client:  k,
+			}
 			c <- msg
 		}
 	}
@@ -152,6 +177,7 @@ func (w *worker) work() {
 }
 
 func main() {
+	debug.SetMemoryLimit(HeapLimit)
 	host := flag.String("host", "127.0.0.1", "host name")
 	port := flag.Uint("port", 9001, "port number")
 	flag.Parse()
@@ -163,7 +189,6 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	// close listener
 	defer listen.Close()
 	println("listening", *host+":"+strconv.Itoa(int(*port)))
 	for {
@@ -175,41 +200,50 @@ func main() {
 	}
 }
 
-func parseString(conn *net.Conn) (string, error) {
-	err := (*conn).SetReadDeadline(time.Now().Add(time.Second * 5))
-	if err != nil {
-		println("failed to remove timeout", (*conn).RemoteAddr().String())
-		return "", err
-	}
+func parseSize(conn *net.Conn) (uint32, error) {
 	buf := make([]byte, 4)
 
-	_, err = (*conn).Read(buf)
+	_, err := (*conn).Read(buf)
 	if err != nil {
 		println("failed to read", (*conn).RemoteAddr().String())
-		return "", err
+		return 0, err
 	}
 
 	size := binary.BigEndian.Uint32(buf)
+	if size > AllocationLimit {
+		println("preventing huge allocation", (*conn).RemoteAddr().String())
+		return 0, ClientCorrupted{}
+	}
+
+	return size, nil
+}
+
+func parseString(conn *net.Conn) (string, error) {
+	err := (*conn).SetReadDeadline(time.Now().Add(time.Second * 3))
+	if err != nil {
+		println("failed to add timeout", (*conn).RemoteAddr().String())
+		return "", err
+	}
+	size, err := parseSize(conn)
+	if err != nil {
+		return "", err
+	}
 	str := make([]byte, size)
 	_, err = (*conn).Read(str)
 	if err != nil {
 		println("read timeout", (*conn).RemoteAddr().String())
 		return "", err
 	} else {
+		// return "", nil
 		return string(str), nil
 	}
 }
 
 func parseArray(conn *net.Conn) ([]string, error) {
-	buf := make([]byte, 4)
-
-	_, err := (*conn).Read(buf)
+	size, err := parseSize(conn)
 	if err != nil {
-		println("failed to read", (*conn).RemoteAddr().String())
 		return nil, err
 	}
-
-	size := binary.BigEndian.Uint32(buf)
 	strings := make([]string, size)
 	for i := range strings {
 		str, err := parseString(conn)
@@ -237,7 +271,9 @@ func parseSubscribe(conn *net.Conn, woke *chan message) error {
 			channels: channels,
 		},
 	}
-	println("parsed subscribe")
+	if DEBUG {
+		println("parsed subscribe")
+	}
 	return nil
 }
 
@@ -255,7 +291,7 @@ func parsePublish(conn *net.Conn, woke *chan message) error {
 		typ: publish,
 		data: publishMessage{
 			channel: channel,
-			msg:     msg,
+			msg:     &msg,
 		},
 	}
 	return nil
@@ -311,26 +347,24 @@ func parseDisconnect(conn *net.Conn, woke *chan message) error {
 	return nil
 }
 
-func encodeString(str string) []byte {
+func dispatchEvent(conn *net.Conn, msg dispatchMessage) error {
 	buf := make([]byte, 4)
-	binary.BigEndian.PutUint32(buf, uint32(len(str)))
-	buf = append(buf, []byte(str)...)
-	return buf
-}
+	binary.BigEndian.PutUint32(buf, uint32(len(msg.channel)))
+	_, err := (*conn).Write(buf)
+	_, err = (*conn).Write([]byte(msg.channel))
 
-func dispatchEvent(conn *net.Conn, msg publishMessage) error {
-	println("fake dispatch", msg.channel, msg.msg)
+	binary.BigEndian.PutUint32(buf, uint32(len(msg.client)))
+	_, err = (*conn).Write(buf)
+	_, err = (*conn).Write([]byte(msg.client))
 
-	_, err := (*conn).Write(encodeString(msg.channel))
-	if err != nil {
-		return err
-	}
-	_, err = (*conn).Write(encodeString(msg.msg))
+	binary.BigEndian.PutUint32(buf, uint32(len(*msg.msg)))
+	_, err = (*conn).Write(buf)
+	_, err = (*conn).Write([]byte(*msg.msg))
+
 	if err != nil {
 		return err
 	}
 	return nil
-	// (*conn).Write()
 }
 
 func handleClientSend(conn *net.Conn, client chan message) {
@@ -341,7 +375,7 @@ func handleClientSend(conn *net.Conn, client chan message) {
 		case destroy:
 			return
 		case publish:
-			data := mes.data.(publishMessage)
+			data := mes.data.(dispatchMessage)
 			if err := dispatchEvent(conn, data); err != nil {
 				return
 			}
@@ -377,7 +411,9 @@ func handleIncomingRequest(conn net.Conn, woke chan message) {
 			return
 		}
 		if n, err := conn.Read(buffer); err == nil {
-			println("received message", buffer[0], conn.RemoteAddr().String(), n)
+			if DEBUG {
+				println("received message", buffer[0], conn.RemoteAddr().String(), n)
+			}
 			switch buffer[0] {
 			case connect:
 				err := parseConnect(&conn, &woke, cha)
@@ -406,6 +442,7 @@ func handleIncomingRequest(conn net.Conn, woke chan message) {
 				}
 			default:
 				println("received unknown message", buffer[0], conn.RemoteAddr().String())
+				return
 			}
 		} else {
 			println("failed to read message", err.Error(), conn.RemoteAddr().String())
