@@ -2,14 +2,14 @@ package main
 
 import (
 	"encoding/binary"
+	"flag"
 	"log"
 	"net"
+	"strconv"
 	"time"
 )
 
 const (
-	HOST = "localhost"
-	PORT = "9001"
 	TYPE = "tcp"
 )
 
@@ -93,18 +93,6 @@ func (w *worker) subscribe(clients []string, channels []string) {
 
 func (w *worker) unsubscribe(clients []string, channels []string) {
 	for _, channel := range channels {
-		/*
-			oldClients := w.subMapping[channel]
-			newClients := make([]string, len(oldClients)-len(clients))
-
-			for _, cl := range clients {
-				if !slices.Contains(oldClients, cl) {
-					newClients = append(newClients, cl)
-				}
-			}
-			w.subMapping[channel] = newClients
-
-		*/
 		for _, client := range clients {
 			delete(w.subMapping[channel], client)
 		}
@@ -164,16 +152,20 @@ func (w *worker) work() {
 }
 
 func main() {
+	host := flag.String("host", "127.0.0.1", "host name")
+	port := flag.Uint("port", 9001, "port number")
+	flag.Parse()
+
 	worker := makeWorker()
 	go worker.work()
 
-	listen, err := net.Listen(TYPE, HOST+":"+PORT)
+	listen, err := net.Listen(TYPE, *host+":"+strconv.Itoa(int(*port)))
 	if err != nil {
 		log.Fatal(err)
 	}
 	// close listener
 	defer listen.Close()
-	println("listening", HOST+":"+PORT)
+	println("listening", *host+":"+strconv.Itoa(int(*port)))
 	for {
 		conn, err := listen.Accept()
 		if err != nil {
@@ -342,6 +334,7 @@ func dispatchEvent(conn *net.Conn, msg publishMessage) error {
 }
 
 func handleClientSend(conn *net.Conn, client chan message) {
+	defer close(client)
 	for {
 		mes := <-client
 		switch mes.typ {
@@ -352,6 +345,8 @@ func handleClientSend(conn *net.Conn, client chan message) {
 			if err := dispatchEvent(conn, data); err != nil {
 				return
 			}
+		default:
+			println("unknown message type", mes.typ)
 		}
 	}
 }
@@ -362,13 +357,16 @@ func handleIncomingRequest(conn net.Conn, woke chan message) {
 	buffer := make([]byte, 1)
 	go handleClientSend(&conn, cha)
 
-	defer close(cha)
 	defer conn.Close()
 	defer func() {
 		println("destroying connection", conn.RemoteAddr().String())
 		woke <- message{
 			typ:  destroy,
 			data: destroyMessage{channel: cha},
+		}
+		cha <- message{
+			typ:  destroy,
+			data: nil,
 		}
 	}()
 
